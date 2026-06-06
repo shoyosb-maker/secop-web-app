@@ -12,7 +12,16 @@ import { AlertPanel } from './components/alerts/AlertPanel';
 import { AlertNotification } from './components/alerts/AlertNotification';
 import { ProcessModal } from './components/details/ProcessModal';
 import { Dashboard } from './components/dashboard/Dashboard';
-import { saveActivity, syncLocalBackup, RecentActivity } from './services/googleSheets.service';
+import { 
+  getSessionId, 
+  saveAlert as saveAlertToSupabase, 
+  getUserAlerts, 
+  deleteAlert as deleteAlertFromSupabase,
+  saveSavedProcess,
+  removeSavedProcess,
+  getSavedProcesses,
+  saveRecentActivity
+} from './services/supabase.service';
 
 function App() {
   const [loading, setLoading] = useState(false);
@@ -31,7 +40,7 @@ function App() {
   const [alertName, setAlertName] = useState('');
   const [notifications, setNotifications] = useState<Notification[]>([]);
   
-  const [savedProcesses, setSavedProcesses] = useState<Process[]>([]);
+  const [savedProcessIds, setSavedProcessIds] = useState<string[]>([]);
   
   const [entityName, setEntityName] = useState('');
   const [department, setDepartment] = useState('');
@@ -46,102 +55,77 @@ function App() {
   const [showFilters, setShowFilters] = useState(false);
 
   const pageSize = 10;
+  const sessionId = getSessionId();
 
-  // Generar o recuperar session ID para usuario
-  const getSessionId = () => {
-    let sessionId = localStorage.getItem('secop_session_id');
-    if (!sessionId) {
-      sessionId = 'user_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8);
-      localStorage.setItem('secop_session_id', sessionId);
-    }
-    return sessionId;
-  };
-
-  // Sincronizar respaldo local al iniciar
+  // Cargar datos desde Supabase al iniciar
   useEffect(() => {
-    syncLocalBackup();
+    loadAlerts();
+    loadSavedProcesses();
   }, []);
 
-  // Guardar actividad reciente en Google Sheets
-  const saveToRecentActivity = async (process: Process) => {
-    const activity: RecentActivity = {
-      timestamp: new Date().toISOString(),
-      process_id: process.id,
-      entity: process.entity,
-      title: process.title,
-      modality: process.modality || 'No especificada',
-      base_value: process.base_value,
-      status: process.status,
-      user_session: getSessionId()
-    };
-    
-    const result = await saveActivity(activity);
-    if (!result.success) {
-      console.log('Actividad guardada localmente:', result.message);
+  const loadAlerts = async () => {
+    const { data, error } = await getUserAlerts(sessionId);
+    if (!error && data) {
+      const formattedAlerts: Alert[] = data.map(alert => ({
+        id: alert.id.toString(),
+        name: alert.name,
+        query: alert.query,
+        filters: alert.filters,
+        createdAt: alert.created_at,
+        lastChecked: alert.last_check || alert.created_at,
+        lastResultCount: alert.last_count || 0
+      }));
+      setAlerts(formattedAlerts);
     }
   };
 
-  useEffect(() => {
-    const savedAlerts = localStorage.getItem('secop_alerts');
-    if (savedAlerts) {
-      setAlerts(JSON.parse(savedAlerts));
+  const loadSavedProcesses = async () => {
+    const { data, error } = await getSavedProcesses(sessionId);
+    if (!error && data) {
+      setSavedProcessIds(data.map(item => item.process_id));
     }
-    const saved = localStorage.getItem('secop_saved_processes');
-    if (saved) {
-      setSavedProcesses(JSON.parse(saved));
-    }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem('secop_alerts', JSON.stringify(alerts));
-  }, [alerts]);
-
-  useEffect(() => {
-    localStorage.setItem('secop_saved_processes', JSON.stringify(savedProcesses));
-  }, [savedProcesses]);
-
-  useEffect(() => {
-    setCity('');
-  }, [department]);
-
-  const getCurrentFilters = () => {
-    const filters: any = {};
-    if (entityName) filters.entity_name = entityName;
-    if (department) filters.department = department;
-    if (city) filters.city = city;
-    if (modality) filters.modality = modality;
-    if (phase) filters.phase = phase;
-    if (status) filters.status = status;
-    if (minValue) filters.min_value = Number(minValue);
-    if (maxValue) filters.max_value = Number(maxValue);
-    return filters;
   };
 
-  const saveAlert = () => {
+  const saveAlert = async () => {
     if (!alertName.trim()) {
       alert('Por favor ingresa un nombre para la alerta');
       return;
     }
     
-    const newAlert: Alert = {
-      id: Date.now().toString(),
+    const filters = getCurrentFilters();
+    
+    const { data, error } = await saveAlertToSupabase({
+      user_session: sessionId,
       name: alertName,
       query: query,
-      filters: getCurrentFilters(),
-      createdAt: new Date().toISOString(),
-      lastChecked: new Date().toISOString(),
-      lastResultCount: results.length
-    };
+      filters: filters
+    });
     
-    setAlerts([...alerts, newAlert]);
-    setAlertName('');
-    setShowAlertPanel(false);
-    alert(`Alerta "${alertName}" guardada correctamente`);
+    if (!error && data) {
+      const newAlert: Alert = {
+        id: data[0].id.toString(),
+        name: alertName,
+        query: query,
+        filters: filters,
+        createdAt: new Date().toISOString(),
+        lastChecked: new Date().toISOString(),
+        lastResultCount: results.length
+      };
+      setAlerts([...alerts, newAlert]);
+      setAlertName('');
+      setShowAlertPanel(false);
+      alert(`Alerta "${alertName}" guardada correctamente`);
+    } else {
+      alert('Error al guardar la alerta');
+    }
   };
 
-  const deleteAlert = (id: string) => {
+  const deleteAlert = async (id: string) => {
     if (confirm('¿Estás seguro de eliminar esta alerta?')) {
-      setAlerts(alerts.filter(a => a.id !== id));
+      const { error } = await deleteAlertFromSupabase(parseInt(id), sessionId);
+      if (!error) {
+        setAlerts(alerts.filter(a => a.id !== id));
+      }
     }
   };
 
@@ -184,11 +168,11 @@ function App() {
           const data = await response.json();
           const newCount = data.data?.length || 0;
           
-          if (newCount > alert.lastResultCount) {
+          if (newCount > (alert.lastResultCount || 0)) {
             hasNewResults = true;
             setNotifications(prev => [...prev, {
               alertId: alert.id,
-              message: `🔔 "${alert.name}" tiene ${newCount - alert.lastResultCount} proceso(s) nuevo(s)`
+              message: `🔔 "${alert.name}" tiene ${newCount - (alert.lastResultCount || 0)} proceso(s) nuevo(s)`
             }]);
           }
           
@@ -210,6 +194,19 @@ function App() {
         setNotifications([]);
       }, 10000);
     }
+  };
+
+  const getCurrentFilters = () => {
+    const filters: any = {};
+    if (entityName) filters.entity_name = entityName;
+    if (department) filters.department = department;
+    if (city) filters.city = city;
+    if (modality) filters.modality = modality;
+    if (phase) filters.phase = phase;
+    if (status) filters.status = status;
+    if (minValue) filters.min_value = Number(minValue);
+    if (maxValue) filters.max_value = Number(maxValue);
+    return filters;
   };
 
   const handleSearch = async (e: React.FormEvent) => {
@@ -254,8 +251,17 @@ function App() {
   };
 
   const handleProcessClick = async (process: Process) => {
-    // Guardar en actividad reciente (Google Sheets)
-    await saveToRecentActivity(process);
+    // Guardar en actividad reciente (Supabase)
+    await saveRecentActivity({
+      user_session: sessionId,
+      process_id: process.id,
+      entity: process.entity,
+      title: process.title,
+      modality: process.modality || 'No especificada',
+      base_value: process.base_value,
+      status: process.status
+    });
+    
     setSelectedProcess(process);
     setShowModal(true);
   };
@@ -278,8 +284,16 @@ function App() {
     setStatus('');
   };
 
-  const removeSavedProcess = (id: string) => {
-    setSavedProcesses(savedProcesses.filter(p => p.id !== id));
+  const toggleSavedProcess = async (process: Process) => {
+    if (savedProcessIds.includes(process.id)) {
+      await removeSavedProcess(sessionId, process.id);
+      setSavedProcessIds(savedProcessIds.filter(id => id !== process.id));
+      alert('Proceso eliminado de guardados');
+    } else {
+      await saveSavedProcess(sessionId, process.id);
+      setSavedProcessIds([...savedProcessIds, process.id]);
+      alert('Proceso guardado correctamente');
+    }
   };
 
   const handleRefresh = () => {
@@ -289,6 +303,9 @@ function App() {
       window.location.reload();
     }
   };
+
+  // Obtener los procesos completos que están guardados
+  const savedProcesses = results.filter(p => savedProcessIds.includes(p.id));
 
   const renderContent = () => {
     switch (activeTab) {
@@ -424,7 +441,7 @@ function App() {
                             }}
                             onClick={(e) => { 
                               e.stopPropagation(); 
-                              removeSavedProcess(process.id);
+                              toggleSavedProcess(process);
                             }}
                           >
                             Eliminar
@@ -493,7 +510,7 @@ function App() {
       <Sidebar 
         activeTab={activeTab} 
         onTabChange={setActiveTab}
-        savedCount={savedProcesses.length}
+        savedCount={savedProcessIds.length}
       />
 
       <div style={{ flex: 1, marginLeft: '280px' }}>
